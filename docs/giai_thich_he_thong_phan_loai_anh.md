@@ -1,398 +1,813 @@
-# 1. OVERVIEW (BIG PICTURE)
+# Giải Thích Hệ Thống Phân Loại Ảnh Nông Sản Farmlink
 
-Dự án này là một hệ thống phân loại ảnh nông sản. Mục tiêu là nhận một ảnh đầu vào và dự đoán ảnh đó thuộc loại nông sản nào, ví dụ: xoài, nhãn, bưởi, cà chua, dưa hấu, sầu riêng, hoặc nhóm `other` nếu ảnh không phải nhóm sản phẩm cần nhận diện.
+Tài liệu này mô tả đầy đủ project `train_farmlink`: mục tiêu, dữ liệu, flow xử lý, công nghệ sử dụng, cách train, cách inference và các artifact quan trọng. Mục tiêu là để một dev mới, người review đồ án, hoặc người vận hành hệ thống có thể đọc một lần và hiểu project đang làm gì, chạy như thế nào, và vì sao pipeline được thiết kế như hiện tại.
 
-Luồng sử dụng thực tế có thể hiểu như sau:
+## 1. Tổng Quan Project
 
-1. Người dùng upload một ảnh lên hệ thống.
-2. Ảnh được tiền xử lý giống lúc train: mở ảnh an toàn, sửa EXIF orientation, chuyển RGB, resize/padding về đúng kích thước.
-3. Model trả về xác suất cho từng class.
-4. Hệ thống chọn class có xác suất cao nhất.
-5. Nếu xác suất thấp hơn ngưỡng tin cậy, hệ thống trả về `unknown` hoặc `other` tùy pipeline inference.
+`train_farmlink` là project machine learning dùng để huấn luyện và kiểm thử hệ thống phân loại ảnh nông sản. Đầu vào là một ảnh do người dùng upload. Đầu ra là nhãn dự đoán, ví dụ `mango`, `banana`, `durian`, `tomato`, hoặc `other` nếu ảnh không phải nông sản trong phạm vi nhận diện.
 
-Ví dụ: người dùng upload ảnh quả xoài. Model tính xác suất cho tất cả class, thấy `mango` có xác suất cao nhất là 0.87, cao hơn threshold 0.60, nên kết quả cuối cùng là `mango`.
+Project hiện ưu tiên pipeline ResNet50 two-stage:
 
-Lưu ý quan trọng: mô tả ban đầu nói 45 classes, nhưng code hiện tại đang cấu hình `expected_num_classes = 44`, và các thư mục `dataset/train`, `dataset/val`, `dataset/test` hiện có 44 class folder, bao gồm cả `other`. Khi đọc hoặc train lại dự án, nên kiểm tra lại danh sách class thực tế để tránh lỗi mismatch số lớp.
+1. Stage A kiểm tra ảnh có phải nông sản hay không.
+2. Nếu Stage A kết luận không phải nông sản, hệ thống trả về `other`.
+3. Nếu Stage A kết luận là nông sản, ảnh được đưa sang Stage B.
+4. Stage B phân loại ảnh vào một trong các class nông sản cụ thể.
 
-# 2. DATA PIPELINE
+Thiết kế two-stage giúp hệ thống phù hợp hơn với upload thực tế. Người dùng có thể upload ảnh bất kỳ, không chỉ ảnh trái cây hoặc rau củ. Nếu chỉ dùng một model multi-class có class `other`, model dễ bị nhiễu vì `other` là một nhóm rất rộng. Tách Stage A thành cổng kiểm tra `fruit` vs `other` giúp Stage B tập trung vào phân biệt các nông sản cụ thể.
 
-## 2.1 Raw Data
+## 2. Bài Toán Cần Giải Quyết
 
-Dữ liệu gốc nằm trong `dataset/raw`.
+Trong thực tế, hệ thống cần xử lý hai câu hỏi khác nhau:
 
-Cấu trúc cơ bản:
+1. Ảnh này có thuộc miền nông sản cần nhận diện không?
+2. Nếu có, ảnh này là loại nông sản nào?
 
-- `dataset/raw/ambarella`
-- `dataset/raw/apple`
-- `dataset/raw/banana`
-- `dataset/raw/longan_c`
-- `dataset/raw/mango_c`
-- `dataset/raw/other`
-- ...
+Stage A trả lời câu hỏi thứ nhất. Stage B trả lời câu hỏi thứ hai.
 
-Mỗi thư mục con tương ứng với một class. Tên thư mục raw có thể hơi khác nhau, ví dụ có dấu cách, có hậu tố `_c`, hoặc dùng tên tiếng Anh. Code có phần metadata để chuẩn hóa tên class sang format ổn định, ví dụ `bell pepper` thành `bell_pepper`, `passion fruit_c` thành `passion_fruit`.
+Ví dụ flow khi người dùng upload ảnh xoài:
 
-Class `other` là nhóm đặc biệt. Nó chứa ảnh không thuộc nông sản cần nhận diện, ví dụ ảnh xe, chó mèo, cảnh trong nhà, đồ vật, ảnh từ COCO hoặc các nguồn ngoài. Class này giúp model học được rằng không phải ảnh nào upload lên cũng là nông sản.
+```text
+upload image
+-> open image safely
+-> fix EXIF orientation
+-> convert RGB
+-> resize + padding về 320x320
+-> ResNet50 preprocess_input
+-> Stage A: fruit_probability = 0.94
+-> fruit_probability >= threshold
+-> Stage B: mango = 0.87, papaya = 0.05, ...
+-> result: mango
+```
 
-## 2.2 Preprocess
+Ví dụ flow khi người dùng upload ảnh không liên quan:
 
-Pipeline preprocess nằm chính trong `src/preprocess.py`, cấu hình mặc định ở `src/config.py`.
+```text
+upload image
+-> preprocess giống train
+-> Stage A: fruit_probability = 0.12
+-> fruit_probability < threshold
+-> result: other
+```
 
-Preprocess làm các việc chính:
+## 3. Phạm Vi Class
 
-- Đọc ảnh từ `dataset/raw`.
-- Chỉ nhận các extension hợp lệ như `.jpg`, `.jpeg`, `.png`.
-- Mở ảnh an toàn, xử lý lỗi ảnh hỏng.
-- Kiểm tra chất lượng ảnh: ảnh quá nhỏ, quá lớn, tỉ lệ quá lệch sẽ bị loại.
-- Tính độ mờ bằng Laplacian variance; ảnh quá mờ sẽ bị loại.
-- Dùng perceptual hash để phát hiện ảnh trùng lặp.
-- Resize ảnh về kích thước chuẩn, thường là `224x224` cho MobileNetV2 hoặc có thể lớn hơn với ResNet50.
-- Giữ tỉ lệ ảnh bằng padding màu đen thay vì kéo méo ảnh.
-- Lưu ảnh đã xử lý vào `dataset/processed`.
-- Có pipeline làm sạch thêm từ `dataset/processed` sang `dataset/processed_clean`.
+Project đang chốt dữ liệu theo taxonomy mới:
 
-Vì sao preprocess quan trọng:
+- Stage A dùng 44 class folder vật lý trong `dataset/train`, `dataset/val`, `dataset/test`.
+- Trong Stage A, `other` được map thành label `0`, toàn bộ class còn lại được map thành label `1` tức `fruit`.
+- Stage B dùng dataset riêng `dataset_fruit_only`, chỉ chứa class nông sản, không chứa `other`.
+- Stage B hiện kỳ vọng 43 class nông sản ở các script cũ, nhưng taxonomy mới có thể gộp một số nhóm thành class đầu ra chung. Khi train lại, luôn kiểm tra class count thật trong `labels.json` hoặc label manifest của experiment.
 
-- Model cần ảnh đầu vào có kích thước cố định.
-- Ảnh hỏng hoặc ảnh quá mờ làm model học sai.
-- Ảnh trùng lặp có thể làm kết quả đánh giá ảo, vì model có thể gặp gần như cùng ảnh ở train và test.
-- Resize có padding giúp giữ hình dạng thật của trái cây, không làm méo đối tượng.
+Các rule gộp class quan trọng nằm trong `src/taxonomy.py`:
 
-## 2.3 Split
+```text
+black_mulberry, red_mulberry, mulberry, mullberry -> mulberry
+cempedak, jackfruit, jackfruit_cempedak -> jackfruit_cempedak
+bitter_gourd, ridged_gourd, gourd -> gourd
+```
 
-Pipeline split nằm trong `src/splitter.py`.
+Lý do gộp class:
 
-Dataset được chia thành:
+- Một số class có hình ảnh rất giống nhau hoặc tên raw bị lẫn giữa các nguồn.
+- Gộp class giúp giảm nhiễu nhãn và làm bài toán nhất quán hơn.
+- Taxonomy được áp dụng trong bước rebuild/preprocess để output class ổn định giữa các lần chạy.
 
-- `dataset/train`: dùng để model học.
-- `dataset/val`: dùng để kiểm tra trong lúc train, chọn checkpoint tốt và early stopping.
-- `dataset/test`: dùng để đánh giá cuối cùng sau khi train xong.
+## 4. Cấu Trúc Thư Mục
 
-Tỉ lệ mặc định:
+Các thư mục chính của project:
 
-- Train: 70%
-- Validation: 15%
-- Test: 15%
+```text
+train_farmlink/
+├── src/                         # Source code train, preprocess, evaluate, inference
+├── docs/                        # Tài liệu kỹ thuật
+├── requirements-macos.txt       # Dependency cho macOS
+├── setup_macos.sh               # Script setup môi trường
+├── dataset/                     # Dataset gốc và split Stage A, không push git
+├── dataset_fruit_only/          # Dataset Stage B, không push git
+├── experiments/                 # Kết quả train/evaluate, không push git
+├── logs/                        # Log preprocess/split/debug, không push git
+└── models/                      # Model export cuối nếu có, không push git
+```
 
-Việc split được làm theo từng class. Nghĩa là mỗi class đều được chia riêng thành train/val/test, thay vì trộn toàn bộ ảnh rồi chia ngẫu nhiên. Cách này giúp mỗi split vẫn có đủ mẫu của từng class.
+Các folder dữ liệu và model rất nặng nên đã được đưa vào `.gitignore`. GitHub repo chỉ nên chứa source code, docs, config và script setup. Dataset, model `.keras`, log và experiment artifact nên lưu bằng release artifact, cloud storage, hoặc Git LFS nếu thật sự cần version hóa.
 
-Split rất quan trọng để tránh data leakage. Nếu cùng một ảnh xuất hiện ở cả train và test, kết quả test sẽ không còn trung thực. Trong dataloader của ResNet50 còn có kiểm tra hash nội dung file giữa các split để phát hiện trùng lặp thật giữa train/val/test.
+## 5. Dataset Contract
 
-# 3. DATALOADER PIPELINE
+### 5.1 `dataset/raw`
 
-Dataloader nằm trong `src/dataloader.py`.
+`dataset/raw` là dữ liệu gốc ban đầu. Mỗi folder con là một class hoặc một nhóm raw class.
 
-Nhiệm vụ của dataloader là biến ảnh trên ổ đĩa thành `tf.data.Dataset` để đưa vào model.
+Quy tắc:
 
-Luồng chính:
-
-1. Đọc class folder từ `dataset/train`, `dataset/val`, `dataset/test`.
-2. Kiểm tra train/val/test có cùng danh sách class và cùng thứ tự.
-3. Chuẩn hóa tên folder thành clean label, ví dụ `banana_chuoi_725` thành `banana`.
-4. Gán label dạng số nguyên: class đầu tiên là 0, class tiếp theo là 1, ...
-5. Load ảnh, resize/padding, convert sang tensor.
-6. Với train set, áp dụng augmentation.
-7. Áp dụng preprocessing đúng theo backbone.
-8. Nếu train dùng focal loss, label được chuyển sang one-hot.
-9. Batch và prefetch để train nhanh hơn.
-
-Augmentation là kỹ thuật tạo biến thể ảnh trong lúc train. Dự án đang dùng các phép như:
-
-- Lật ngang.
-- Xoay nhẹ.
-- Zoom nhẹ.
-
-Augmentation giúp model không học thuộc ảnh quá cứng. Ví dụ quả xoài có thể nằm lệch, bị xoay nhẹ, hoặc chụp ở nhiều góc khác nhau. Nếu model chỉ thấy ảnh quá sạch và cố định, khi gặp ảnh upload thực tế nó dễ sai.
-
-Preprocessing theo backbone:
-
-- Với MobileNetV2: dùng `tf.keras.applications.mobilenet_v2.preprocess_input`.
-- Với ResNet50: dùng `tf.keras.applications.resnet.preprocess_input`.
-
-Điểm cần chú ý: preprocessing được đặt ở dataloader, không đặt trong model. Vì vậy khi inference cũng phải preprocess ảnh theo cùng contract, nếu không phân phối input sẽ lệch so với lúc train.
-
-# 4. MODEL ARCHITECTURE
-
-Dự án hỗ trợ ít nhất hai backbone:
-
-- MobileNetV2 trong `src/model/mobilenetv2.py`.
-- ResNet50 trong `src/model/resnet50.py`.
-
-Theo yêu cầu hiện tại, trọng tâm là ResNet50.
-
-Kiến trúc ResNet50 classifier:
-
-1. Input ảnh, ví dụ `320x320x3`.
-2. ResNet50 pretrained ImageNet, bỏ phần classifier gốc bằng `include_top=False`.
-3. `GlobalAveragePooling2D` để biến feature map thành vector đặc trưng.
-4. `BatchNormalization`.
-5. `Dense(512, activation="relu")`.
-6. `Dropout(0.5)`.
-7. `Dense(num_classes, activation="softmax")`.
-
-Softmax ở layer cuối trả về xác suất cho từng class. Tổng xác suất của tất cả class bằng 1.
-
-Transfer learning được dùng vì dataset nông sản không đủ lớn để train ResNet50 từ đầu. ResNet50 pretrained trên ImageNet đã biết các đặc trưng cơ bản như cạnh, màu, texture, hình khối. Dự án chỉ cần dạy thêm phần phân biệt các class nông sản cụ thể.
-
-# 5. TRAINING FLOW
-
-Training chính nằm trong `src/train.py`.
-
-## Stage 1: frozen backbone, training classifier
-
-Ở Stage 1, backbone ResNet50 hoặc MobileNetV2 được freeze. Nghĩa là các layer pretrained không thay đổi trọng số.
-
-Chỉ phần classifier head được train:
-
-- Global pooling.
-- Dense layer.
-- Dropout.
-- Dense softmax cuối.
-
-Mục tiêu của Stage 1 là để classifier head học cách map feature ImageNet sang class nông sản của dự án. Cách này ổn định hơn vì không làm hỏng feature pretrained ngay từ đầu.
-
-Với ResNet50, cấu hình trong code hiện tại:
-
-- Image size mặc định: `320x320`.
-- Stage 1 learning rate: `3e-4`.
-- Stage 1 epochs: `15`.
-- Early stopping theo `val_loss`.
-- Lưu checkpoint tốt nhất.
-
-Loss đang dùng là `CategoricalFocalCrossentropy` với label smoothing. Focal loss giúp model chú ý hơn vào các mẫu khó, thay vì chỉ tối ưu tốt cho các class dễ hoặc class nhiều ảnh.
-
-## Stage 2: fine-tuning
-
-Ở Stage 2, dự án mở một phần cuối của backbone để fine-tune.
-
-Với ResNet50:
-
-- Mở khoảng 50 layer cuối.
-- Vẫn giữ BatchNorm frozen.
-- Learning rate thấp hơn, mặc định `1e-5`.
-- Dùng CosineDecay learning rate schedule.
-
-Vì sao unfreezing giúp tốt hơn:
-
-- Stage 1 chỉ học classifier head, nên backbone vẫn là feature ImageNet chung chung.
-- Stage 2 cho phép các layer cuối điều chỉnh theo domain nông sản: màu vỏ, texture, hình dạng trái, đặc điểm lá/cuống, bề mặt quả.
-- Learning rate nhỏ giúp fine-tune nhẹ nhàng, tránh làm mất kiến thức pretrained.
-
-Sau Stage 1 và Stage 2, code so sánh checkpoint theo `val_loss` và chọn model tốt nhất để evaluate trên test set.
-
-Dự án còn có hard example mining cho MobileNetV2 trong một số cấu hình. Ý tưởng là tìm các ảnh model dự đoán sai hoặc không tự tin, sau đó dùng chúng để fine-tune thêm. Với ResNet50 baseline hiện tại, hard mining đang được tắt để kết quả dễ phân tích.
-
-# 6. METRICS (CRITICAL)
-
-## Accuracy
-
-Accuracy là tỉ lệ dự đoán đúng trên tổng số mẫu.
-
-Ví dụ: test set có 1000 ảnh, model đoán đúng 800 ảnh, accuracy = 80%.
-
-Accuracy dễ hiểu, nhưng không đủ trong bài toán này. Nếu class `other` hoặc một vài class mạnh chiếm nhiều ảnh, model có thể đạt accuracy khá cao nhưng vẫn bỏ sót nhiều class yếu.
-
-## Precision
-
-Precision trả lời câu hỏi: trong những ảnh model dự đoán là class X, bao nhiêu ảnh thật sự là class X?
-
-Ví dụ với class `mango`:
-
-- Model dự đoán 100 ảnh là `mango`.
-- Trong đó chỉ 70 ảnh thật sự là mango.
-- Precision của `mango` là 70%.
-
-Precision thấp nghĩa là model hay gán nhầm ảnh class khác vào class này.
-
-## Recall
-
-Recall trả lời câu hỏi: trong tất cả ảnh thật sự thuộc class X, model tìm đúng được bao nhiêu?
-
-Ví dụ với class `mango`:
-
-- Test set có 100 ảnh mango thật.
-- Model chỉ nhận ra đúng 40 ảnh.
-- Recall của `mango` là 40%.
-
-Recall thấp nghĩa là model hay bỏ sót class đó.
-
-## F1-score
-
-F1-score là điểm cân bằng giữa precision và recall.
-
-F1 cao khi cả precision và recall đều tốt. Nếu một trong hai thấp, F1 cũng thấp.
-
-F1 rất quan trọng trong dự án này vì nhiều class có thể bị mất cân bằng. Một class có precision cao nhưng recall rất thấp vẫn là class yếu. Ví dụ model chỉ dám dự đoán `lime` khi cực kỳ chắc, nên precision có thể ổn, nhưng nếu nó bỏ sót gần hết ảnh lime thì recall và F1 vẫn thấp.
-
-## Confusion matrix
-
-Confusion matrix là bảng cho biết model nhầm class nào sang class nào.
-
-Cách đọc:
-
-- Trục dọc là nhãn thật.
-- Trục ngang là nhãn model dự đoán.
-- Ô trên đường chéo là dự đoán đúng.
-- Ô ngoài đường chéo là dự đoán sai.
-
-Ví dụ nếu hàng `lime`, cột `pomelo` có giá trị cao, nghĩa là nhiều ảnh chanh bị dự đoán thành bưởi. Đây là tín hiệu để thu thập thêm dữ liệu hoặc tạo classifier phụ cho cặp dễ nhầm.
-
-## Vì sao accuracy không đủ
-
-Accuracy không cho biết class nào đang bị bỏ sót.
-
-Trong kết quả ResNet50 hiện có, accuracy khoảng 0.5917, nhưng macro recall chỉ khoảng 0.5433 và macro F1 khoảng 0.5614. Điều này nghĩa là nhìn tổng thể model đoán đúng một phần đáng kể, nhưng hiệu năng giữa các class không đều.
-
-Một số class có recall rất thấp, ví dụ trong report hiện có:
-
-- `lime` recall khoảng 0.0114.
-- `coffee` recall khoảng 0.0488.
-- `black_mulberry` recall khoảng 0.0526.
-- `longan` recall khoảng 0.0682.
-- `burmese_grape` recall khoảng 0.1358.
-
-Trong khi đó `other` có recall 1.0000, nghĩa là tất cả ảnh `other` trong test đều được bắt đúng, nhưng điều này cũng có thể cho thấy class `other` đang quá mạnh hoặc model quá dễ nghiêng về `other`.
-
-# 7. LOGGING SYSTEM
-
-Dự án lưu nhiều artifact để debug và tái lập kết quả.
-
-Các file log/artifact chính:
-
-- `logs/preprocess.log`: log quá trình preprocess raw data.
-- `logs/data_clean.log`: log quá trình làm sạch processed data.
-- `logs/data_cleaning.log`: log strict cleaning khi dataloader chạy, đặc biệt với ResNet50.
-- `logs/train.log`: log training nếu dùng cấu hình cũ.
-- `logs/history.json`: lịch sử loss/accuracy theo epoch.
-- `logs/test_results.txt`: kết quả test tổng hợp.
-- `logs/classification_report.txt`: precision, recall, F1 của từng class.
-- `logs/confusion_matrix.png`: ảnh confusion matrix.
-
-Với pipeline training mới, mỗi lần train tạo một experiment riêng trong `experiments/exp_<timestamp>_<model_type>/`, ví dụ:
-
-- `experiments/exp_20260426_094507_resnet50/train.log`
-- `experiments/exp_20260426_094507_resnet50/config.json`
-- `experiments/exp_20260426_094507_resnet50/history.json`
-- `experiments/exp_20260426_094507_resnet50/test_results.txt`
-- `experiments/exp_20260426_094507_resnet50/classification_report.txt`
-- `experiments/exp_20260426_094507_resnet50/confusion_matrix.png`
-- `experiments/exp_20260426_094507_resnet50/model.keras`
-- `experiments/exp_20260426_094507_resnet50/labels.json`
-
-Logs quan trọng vì:
-
-- Biết model train có bị overfit không.
-- Biết stage nào tốt hơn.
-- Biết class nào yếu.
-- Biết ảnh nào bị loại do mờ, lỗi, duplicate.
-- Có thể tái lập experiment dựa trên `config.json`.
-- Backend inference dùng `labels.json` để giữ đúng thứ tự class.
-
-# 8. CURRENT PROBLEMS
-
-Dựa trên kết quả hiện có và cấu trúc dữ liệu, các vấn đề chính là:
-
-1. Class imbalance.
-
-Class `other` có nhiều mẫu hơn nhiều class khác. Trong processed data, `other` có hơn 4000 ảnh, trong khi nhiều class nông sản chỉ khoảng 700-1000 ảnh. Nếu không xử lý kỹ, model sẽ học rất mạnh nhóm `other` và gây lệch kết quả.
-
-2. Một số class có recall thấp.
-
-Recall thấp nghĩa là ảnh thật của class đó thường bị dự đoán sang class khác. Các class như `lime`, `coffee`, `black_mulberry`, `longan`, `burmese_grape` đang là nhóm cần chú ý.
-
-3. Model nhầm giữa các class nhìn giống nhau.
-
-Một số nông sản có hình dạng hoặc màu sắc giống nhau:
-
-- `lime` và `pomelo`.
-- `longan` và `burmese_grape`.
-- `black_mulberry` và `red_mulberry`.
-- `apple`, `otaheite_apple`, một số quả tròn màu đỏ/xanh.
-- `sapodilla`, `canistel`, `mango` trong một số góc chụp.
-
-4. Accuracy tổng thể che giấu lỗi theo class.
-
-Nếu chỉ nhìn accuracy, developer có thể nghĩ model tạm ổn. Nhưng classification report cho thấy nhiều class gần như chưa được nhận diện tốt.
-
-5. Threshold inference có thể làm nhiều ảnh thành `unknown`.
-
-Trong kết quả test hiện có, threshold deploy là 0.60 và có 1443 dự đoán low-confidence trên 4149 ảnh. Điều này cho thấy model chưa đủ tự tin với khá nhiều mẫu.
-
-# 9. INFERENCE FLOW (DEPLOYMENT)
-
-Inference một stage nằm trong `src/evaluate.py` và các hàm tiện ích prediction.
-
-Luồng cơ bản:
-
-1. Load model `.keras`.
-2. Load `labels.json` để lấy đúng `class_names`.
-3. Đọc ảnh upload.
-4. Sửa EXIF orientation, convert RGB.
-5. Kiểm tra chất lượng ảnh nếu bật strict mode.
-6. Resize/padding về đúng `image_size`.
-7. Áp dụng preprocessing đúng backbone.
-8. Model trả về softmax probabilities.
-9. Lấy class có xác suất cao nhất.
-10. So sánh với confidence threshold.
-
-Logic threshold:
-
-- Nếu xác suất cao nhất >= threshold: trả về class đó.
-- Nếu xác suất cao nhất < threshold: trả về `unknown`.
+- Không chỉnh sửa thủ công nếu có thể tránh.
+- Không resize/crop trực tiếp trong raw.
+- Không đổi tên lẻ tẻ sau khi đã train, vì sẽ làm khó tái lập kết quả.
+- Đây là nguồn để rebuild toàn bộ dataset.
 
 Ví dụ:
 
-- `mango`: 0.87
-- `papaya`: 0.05
-- `banana`: 0.03
-- các class khác thấp hơn
+```text
+dataset/raw/
+├── mango/
+├── banana/
+├── dragonfruit/
+├── tomato/
+└── other/
+```
 
-Threshold = 0.60, vậy kết quả là `mango`.
+### 5.2 `dataset/processed_clean`
 
-Ví dụ khác:
+Đây là output của bước preprocess/rebuild từ raw. Ảnh đã được:
 
-- `mango`: 0.31
-- `papaya`: 0.24
-- `sapodilla`: 0.19
-- các class khác thấp hơn
+- mở an toàn,
+- sửa hướng EXIF,
+- convert RGB,
+- kiểm tra chất lượng,
+- loại ảnh hỏng/quá nhỏ/quá lớn/tỉ lệ quá lệch,
+- lọc ảnh quá mờ,
+- lọc trùng bằng perceptual hash,
+- resize giữ tỉ lệ,
+- padding về kích thước chuẩn.
 
-Threshold = 0.60, model không đủ tự tin, kết quả là `unknown`.
+Folder này là dataset sạch trước khi crop.
 
-Dự án cũng có pipeline two-stage trong `src/two_stage_inference.py`:
+### 5.3 `dataset/processed_crop`
 
-- Stage A: phân biệt `fruit` và `other`.
-- Nếu xác suất fruit thấp hơn threshold, trả về `other`.
-- Nếu qua Stage A, Stage B phân loại fruit cụ thể.
+Đây là output của bước smart crop từ `processed_clean`. Mục tiêu là giảm nền thừa quanh vật thể nhưng vẫn an toàn:
 
-Two-stage hữu ích khi class `other` quá mạnh hoặc khi muốn tách bài toán "có phải nông sản không" khỏi bài toán "nông sản này là loại nào".
+- Nếu heuristic crop đủ tự tin, ảnh được crop rồi resize/pad lại.
+- Nếu crop không chắc, ảnh gốc đã chuẩn hóa được giữ lại.
+- Không ghi đè `processed_clean`.
 
-# 10. FINAL SUMMARY
+### 5.4 `dataset/train`, `dataset/val`, `dataset/test`
 
-Hệ thống hiện đã có pipeline khá đầy đủ: preprocess ảnh, split train/val/test, dataloader có augmentation và preprocessing theo backbone, model transfer learning, training 2 stage, evaluation bằng classification report và confusion matrix, logging theo từng experiment, và inference có threshold.
+Đây là split chính cho Stage A.
 
-Phần đang hoạt động tốt:
+Quy tắc:
 
-- Cấu trúc pipeline rõ ràng.
-- Có kiểm tra chất lượng ảnh và duplicate.
-- Có split riêng train/val/test.
-- Có transfer learning với ResNet50/MobileNetV2.
-- Có lưu model, labels, config, history và metric.
-- Có threshold để tránh trả kết quả khi model không tự tin.
+- Có class `other`.
+- Có cùng danh sách class folder giữa train/val/test.
+- Split theo từng class để mỗi class đều có mẫu ở train/val/test.
+- Stage A không dùng trực tiếp nhãn multi-class; nó map `other` thành `0`, class còn lại thành `1`.
 
-Phần chưa tốt:
+### 5.5 `dataset_fruit_only/train`, `dataset_fruit_only/val`, `dataset_fruit_only/test`
 
-- Số class trong mô tả và code đang lệch: mô tả nói 45, code/dataset hiện là 44.
-- Một số class có recall rất thấp.
-- `other` đang rất mạnh.
-- Một số class tương tự nhau bị nhầm nhiều.
-- Accuracy chưa phản ánh đúng chất lượng từng class.
+Đây là split chính cho Stage B.
 
-Nên cải thiện tiếp theo:
+Quy tắc:
 
-- Xác nhận lại danh sách class chính thức: 44 hay 45.
-- Cân bằng lại dữ liệu, đặc biệt class `other` và các class yếu.
-- Thu thập thêm ảnh thật cho các class recall thấp.
-- Phân tích confusion matrix để tìm cặp class hay nhầm.
-- Dùng hard example mining hoặc pairwise classifier cho các cặp khó.
-- Tune threshold theo validation set thay vì dùng cố định 0.60.
-- Theo dõi macro F1 và per-class recall như metric chính, không chỉ accuracy.
+- Không có class `other`.
+- Chỉ chứa các class nông sản cụ thể.
+- Class order phải nhất quán giữa train/val/test.
+- Đây là dữ liệu để train multi-class classifier.
+
+## 6. Flow Tổng Thể Từ Raw Data Đến Model
+
+Flow chuẩn của project:
+
+```text
+dataset/raw
+-> rebuild/preprocess
+-> dataset/processed_clean
+-> smart crop
+-> dataset/processed_crop
+-> split train/val/test
+-> dataset/train, dataset/val, dataset/test
+-> build fruit-only dataset
+-> dataset_fruit_only/train, val, test
+-> train Stage A
+-> train Stage B
+-> evaluate two-stage
+-> inference bằng router_manifest.json
+```
+
+Mỗi bước đều có output rõ ràng để dễ audit. Không nên train trực tiếp từ `dataset/raw` vì raw có thể chứa ảnh lỗi, ảnh trùng, ảnh lệch kích thước hoặc tên class chưa chuẩn hóa.
+
+## 7. Preprocess Và Rebuild Dataset
+
+Code liên quan:
+
+- `src/preprocess.py`: pipeline preprocess cũ/tổng quát.
+- `src/rebuild_dataset.py`: orchestration rebuild dataset theo pipeline mới.
+- `src/taxonomy.py`: chuẩn hóa class name và merge taxonomy.
+- `src/utils.py`: helper mở ảnh, resize/pad, validate chất lượng, hash ảnh.
+
+Các kiểm tra chính:
+
+- Extension hợp lệ: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.gif`, `.webp` tùy script.
+- Ảnh phải mở được bằng PIL.
+- Ảnh được fix EXIF orientation để tránh xoay sai.
+- Ảnh được convert sang RGB.
+- Cạnh nhỏ nhất không được quá nhỏ, mặc định tối thiểu 100 px.
+- Cạnh lớn nhất không được quá lớn, mặc định tối đa 5000 px.
+- Tỉ lệ ảnh không được quá lệch, mặc định max aspect ratio là 4.0.
+- Blur score được tính bằng Laplacian variance, mặc định threshold là 100.0.
+- Perceptual hash dùng để loại ảnh trùng hoặc gần trùng theo ngưỡng cấu hình.
+
+Resize/padding:
+
+- Ảnh không bị kéo méo.
+- Ảnh được resize giữ tỉ lệ.
+- Phần dư được padding màu đen.
+- Với ResNet50, kích thước chuẩn hiện dùng là `320x320`.
+
+Vì sao không kéo ảnh về thẳng `320x320` bằng stretch:
+
+- Trái cây/rau củ có hình dạng là tín hiệu quan trọng.
+- Stretch làm quả tròn thành bầu dục hoặc làm vật thể dài/ngắn bất thường.
+- Padding giữ hình học gốc tốt hơn.
+
+## 8. Smart Crop
+
+Code chính: `src/smart_crop.py`.
+
+Smart crop là bước offline để giảm nền thừa. Script không dùng object detector mà dùng heuristic an toàn dựa trên:
+
+- khác biệt màu so với nền viền ảnh,
+- saturation,
+- edge bằng Canny,
+- morphology để làm sạch mask,
+- area ratio của bounding box,
+- texture score,
+- color contrast,
+- edge density.
+
+Nguyên tắc thiết kế:
+
+- Crop sai nguy hiểm hơn không crop.
+- Nếu object detection heuristic không đủ chắc, giữ ảnh gốc.
+- Luôn ghi log lý do crop hoặc fallback.
+
+Output:
+
+```text
+dataset/processed_crop/
+```
+
+Log:
+
+```text
+logs/smart_crop.log
+```
+
+## 9. Split Dataset
+
+Code chính: `src/splitter.py` và một số script hỗ trợ như `src/split_after_crop.py`.
+
+Dataset được chia thành:
+
+- `train`: để học trọng số.
+- `val`: để chọn checkpoint, early stopping và tune threshold.
+- `test`: để đánh giá cuối cùng.
+
+Tỉ lệ mặc định:
+
+```text
+train = 70%
+val   = 15%
+test  = 15%
+seed  = 42
+```
+
+Split theo từng class, không split ngẫu nhiên toàn bộ ảnh một lần. Cách này giúp mỗi split vẫn có phân phối class ổn định hơn.
+
+Yêu cầu bắt buộc:
+
+- `dataset/train`, `dataset/val`, `dataset/test` phải có cùng class folder.
+- Không split rỗng.
+- Không để cùng một ảnh hoặc ảnh trùng nội dung xuất hiện ở nhiều split.
+
+Dataloader ResNet50 còn có cơ chế strict validation và kiểm tra overlap bằng content hash giữa các split để giảm nguy cơ data leakage.
+
+## 10. Dataloader
+
+Code chính: `src/dataloader.py`.
+
+Dataloader có nhiệm vụ biến file ảnh trên ổ đĩa thành `tf.data.Dataset`.
+
+Luồng xử lý:
+
+1. Đọc folder `train`, `val`, `test`.
+2. Liệt kê class folder theo thứ tự ổn định.
+3. Chuẩn hóa tên label bằng `extract_clean_label`.
+4. Kiểm tra train/val/test có class list nhất quán.
+5. Scan ảnh hợp lệ theo extension.
+6. Kiểm tra chất lượng ảnh khi strict validation bật.
+7. Map label folder thành integer label hoặc one-hot label.
+8. Decode ảnh bằng TensorFlow.
+9. Resize/pad về `image_size`.
+10. Augment train set.
+11. Áp dụng preprocessing theo backbone.
+12. Batch và prefetch.
+
+ResNet50 mặc định dùng:
+
+```text
+image_size = 320x320
+preprocess = tf.keras.applications.resnet.preprocess_input
+```
+
+MobileNetV2 vẫn còn code hỗ trợ legacy:
+
+```text
+image_size = 224x224
+preprocess = tf.keras.applications.mobilenet_v2.preprocess_input
+```
+
+Pipeline chính hiện tại dùng ResNet50.
+
+## 11. Kiến Trúc Model
+
+### 11.1 Backbone
+
+Backbone chính: `tf.keras.applications.ResNet50`.
+
+Cấu hình:
+
+```text
+weights     = "imagenet"
+include_top = False
+input_shape = (320, 320, 3)
+```
+
+Project dùng transfer learning vì dataset nông sản không đủ lớn để train ResNet50 từ đầu. ResNet50 pretrained trên ImageNet đã học được các feature nền tảng như cạnh, texture, màu sắc, hình khối. Project chỉ fine-tune để backbone phù hợp hơn với domain nông sản.
+
+### 11.2 Stage A: Binary Classifier
+
+Code chính: `src/model/binary.py`, train bằng `src/train_stage_a.py`.
+
+Nhiệm vụ:
+
+```text
+other vs fruit
+```
+
+Label:
+
+```text
+0 = other
+1 = fruit
+```
+
+Kiến trúc head:
+
+```text
+ResNet50 backbone
+-> GlobalAveragePooling2D
+-> BatchNormalization
+-> Dense(head_units=256, relu)
+-> Dropout(0.5)
+-> Dense(1, sigmoid)
+```
+
+Output sigmoid là `fruit_probability`. Nếu xác suất này thấp hơn threshold, router trả về `other`.
+
+Loss/metric:
+
+- BinaryCrossentropy.
+- Accuracy.
+- AUC.
+- Precision.
+- Recall.
+
+Stage A có class weight vì `fruit` là tổng của nhiều class nên thường nhiều mẫu hơn `other`.
+
+### 11.3 Stage B: Multi-class Fruit Classifier
+
+Code chính: `src/model/resnet50.py`, train bằng `src/train_stage_b.py`.
+
+Nhiệm vụ:
+
+```text
+fruit image -> one specific fruit/agricultural class
+```
+
+Stage B không được chứa `other`.
+
+Kiến trúc head:
+
+```text
+ResNet50 backbone
+-> GlobalAveragePooling2D
+-> BatchNormalization
+-> Dense(head_units=512, relu)
+-> Dropout(0.5)
+-> Dense(num_classes, softmax)
+```
+
+Output softmax là xác suất cho từng class. Tổng xác suất bằng 1.
+
+Metric chính:
+
+- Accuracy.
+- Classification report theo từng class.
+- Macro precision/recall/F1.
+- Weighted precision/recall/F1.
+- Confusion matrix.
+- Weak class report theo recall threshold.
+
+## 12. Training Flow
+
+Project train theo 2 phase trong mỗi stage:
+
+### 12.1 Phase 1: Train Head
+
+Backbone ResNet50 được freeze. Chỉ classifier head được train.
+
+Mục tiêu:
+
+- Học mapping từ feature ImageNet sang nhãn của project.
+- Tránh làm hỏng pretrained weights ngay từ đầu.
+- Tạo baseline ổn định trước khi fine-tune.
+
+Learning rate mặc định:
+
+```text
+3e-4
+```
+
+### 12.2 Phase 2: Fine-tune Backbone
+
+Một số layer cuối của ResNet50 được mở train.
+
+Cấu hình thường dùng:
+
+```text
+fine_tune_last_layers = 50
+learning_rate         = 1e-5
+BatchNorm             = frozen
+```
+
+BatchNormalization được giữ frozen vì batch size local thường nhỏ. Nếu train lại BatchNorm, moving mean/variance dễ lệch và làm model kém ổn định.
+
+Stage 2 dùng learning rate thấp và có thể dùng CosineDecay để fine-tune nhẹ hơn.
+
+## 13. Script Chính Và Vai Trò
+
+Các script quan trọng:
+
+```text
+src/rebuild_dataset.py
+```
+
+Rebuild dataset từ raw, áp dụng taxonomy, preprocess, ghi report.
+
+```text
+src/smart_crop.py
+```
+
+Tạo `dataset/processed_crop` từ `dataset/processed_clean`.
+
+```text
+src/splitter.py
+src/split_after_crop.py
+```
+
+Chia dataset thành train/val/test.
+
+```text
+src/build_fruit_only_dataset.py
+src/create_fruit_only_dataset.py
+```
+
+Tạo dataset Stage B bằng cách loại `other`.
+
+```text
+src/train_stage_a.py
+```
+
+Train riêng Stage A: `other` vs `fruit`.
+
+```text
+src/train_stage_b.py
+```
+
+Train riêng Stage B: phân loại class nông sản.
+
+```text
+src/train_two_stage.py
+```
+
+Train hoặc orchestration cho hệ thống two-stage.
+
+```text
+src/evaluate_upload_flow.py
+src/evaluate_supported_v1_uploads.py
+src/test_upload_flow_production.py
+```
+
+Đánh giá flow upload/inference trên dữ liệu test hoặc bộ upload đã gán nhãn.
+
+```text
+src/two_stage_inference.py
+```
+
+CLI và function inference two-stage dùng `router_manifest.json`.
+
+## 14. Cách Chạy Tham Khảo
+
+Tạo môi trường macOS:
+
+```bash
+./setup_macos.sh
+```
+
+Train Stage A:
+
+```bash
+.venv/bin/python src/train_stage_a.py \
+  --dataset-root dataset \
+  --experiment-root experiments \
+  --image-size 320 \
+  --batch-size 32
+```
+
+Train Stage B:
+
+```bash
+.venv/bin/python src/train_stage_b.py \
+  --dataset-root dataset_fruit_only \
+  --experiment-root experiments \
+  --image-size 320 \
+  --batch-size 16
+```
+
+Train orchestration two-stage:
+
+```bash
+.venv/bin/python src/train_two_stage.py \
+  --stage full \
+  --dataset-root dataset \
+  --stage-b-dataset-root dataset_fruit_only \
+  --experiment-root experiments \
+  --image-size 320 \
+  --batch-size 32
+```
+
+Inference một ảnh bằng router manifest:
+
+```bash
+.venv/bin/python src/two_stage_inference.py \
+  --image path/to/upload.jpg \
+  --router experiments/two_stage_xxx/router_manifest.json \
+  --top-k 5
+```
+
+Nếu muốn bắt lỗi ảnh chất lượng thấp thay vì chỉ warning:
+
+```bash
+.venv/bin/python src/two_stage_inference.py \
+  --image path/to/upload.jpg \
+  --router experiments/two_stage_xxx/router_manifest.json \
+  --strict-quality-check
+```
+
+## 15. Inference Router
+
+Code chính: `src/two_stage_inference.py`.
+
+Router cần một file:
+
+```text
+router_manifest.json
+```
+
+Manifest này cho biết:
+
+- path tới model Stage A,
+- path tới label manifest Stage A,
+- path tới model Stage B,
+- path tới label manifest Stage B,
+- image size,
+- model type,
+- preprocess contract,
+- `fruit_threshold`,
+- `stage_b_confidence_threshold`.
+
+Logic inference:
+
+1. Load router manifest.
+2. Resolve path model/label theo experiment directory.
+3. Load model Stage A và Stage B.
+4. Mở ảnh upload an toàn.
+5. Validate chất lượng cơ bản.
+6. Resize/pad về kích thước model.
+7. Áp dụng `tf.keras.applications.resnet.preprocess_input`.
+8. Chạy Stage A để lấy `fruit_probability`.
+9. Nếu `fruit_probability < fruit_threshold`, trả `other`.
+10. Nếu qua gate, chạy Stage B.
+11. Lấy top-k class theo softmax.
+12. Nếu confidence Stage B thấp hơn threshold, đánh dấu `low_confidence = true`.
+
+Output ví dụ:
+
+```json
+{
+  "predicted_label": "mango",
+  "confidence": 0.87,
+  "route": "stage_b_fruit",
+  "low_confidence": false,
+  "stage_a": {
+    "fruit_probability": 0.94,
+    "fruit_threshold": 0.5
+  },
+  "stage_b": {
+    "confidence_threshold": 0.6,
+    "top_k_predictions": [
+      {
+        "class_index": 12,
+        "label": "mango",
+        "confidence": 0.87
+      }
+    ]
+  },
+  "warnings": [],
+  "image_path": "path/to/upload.jpg"
+}
+```
+
+## 16. Artifact Trong Experiment
+
+Mỗi lần train nên tạo folder riêng trong `experiments/`.
+
+Ví dụ:
+
+```text
+experiments/stage_a_resnet50_YYYYMMDD_HHMMSS/
+experiments/stage_b_resnet50_YYYYMMDD_HHMMSS/
+experiments/two_stage_YYYYMMDD_HHMMSS_resnet50/
+```
+
+Artifact thường có:
+
+```text
+config.json
+train.log
+history.json
+model.keras
+labels.json hoặc label_manifest.json
+classification_report.txt
+confusion_matrix.npy hoặc confusion_matrix.png
+test_results.txt
+weak_classes.json
+confused_pairs.json
+router_manifest.json
+error_cases.csv
+```
+
+Ý nghĩa:
+
+- `config.json`: biết model được train với tham số nào.
+- `train.log`: audit quá trình train theo epoch.
+- `history.json`: loss/metric từng epoch để vẽ biểu đồ.
+- `model.keras`: model đã lưu.
+- `labels.json`: class order bắt buộc khi inference.
+- `classification_report.txt`: precision/recall/F1 theo class.
+- `confusion_matrix`: xem model nhầm class nào sang class nào.
+- `weak_classes.json`: danh sách class có recall thấp hơn threshold.
+- `router_manifest.json`: contract để backend/inference load đúng model và preprocess.
+
+## 17. Metric Và Cách Đọc Kết Quả
+
+### Accuracy
+
+Accuracy là tỷ lệ dự đoán đúng trên tổng số mẫu. Metric này dễ hiểu nhưng không đủ trong bài toán nhiều class và mất cân bằng dữ liệu.
+
+### Precision
+
+Precision cho biết trong tất cả ảnh model dự đoán là class X, bao nhiêu ảnh thật sự là X.
+
+Precision thấp nghĩa là model hay gán nhầm ảnh class khác vào class X.
+
+### Recall
+
+Recall cho biết trong tất cả ảnh thật sự thuộc class X, model bắt đúng được bao nhiêu.
+
+Recall thấp nghĩa là model hay bỏ sót class X.
+
+### F1-score
+
+F1-score cân bằng precision và recall. Nếu một trong hai thấp, F1 cũng thấp.
+
+### Macro Average
+
+Macro average tính trung bình đều giữa các class. Mỗi class có trọng số như nhau, kể cả class ít ảnh. Đây là metric quan trọng để biết model có đang bỏ rơi class yếu không.
+
+### Weighted Average
+
+Weighted average tính trung bình theo số mẫu từng class. Class nhiều ảnh ảnh hưởng nhiều hơn. Metric này phản ánh performance tổng thể theo phân phối test set.
+
+### Confusion Matrix
+
+Confusion matrix cho biết class thật bị dự đoán nhầm sang class nào.
+
+Cách đọc:
+
+- Hàng là nhãn thật.
+- Cột là nhãn dự đoán.
+- Đường chéo là dự đoán đúng.
+- Ô ngoài đường chéo là lỗi.
+
+Nếu hàng `lime`, cột `pomelo` cao, model đang nhầm nhiều ảnh chanh thành bưởi. Đây là tín hiệu để kiểm tra dữ liệu, bổ sung ảnh, hoặc cân nhắc gộp/tách taxonomy.
+
+## 18. Các Công Nghệ Sử Dụng
+
+Ngôn ngữ:
+
+- Python.
+
+Deep learning:
+
+- TensorFlow.
+- Keras.
+- ResNet50 pretrained ImageNet.
+- MobileNetV2 còn trong code cho legacy/baseline, không phải pipeline chính hiện tại.
+
+Xử lý ảnh:
+
+- Pillow/PIL để mở ảnh, fix EXIF, convert RGB, lưu ảnh.
+- OpenCV để xử lý edge/mask trong smart crop.
+- NumPy để xử lý array.
+
+Machine learning utility:
+
+- scikit-learn cho classification report, confusion matrix, class weight.
+
+Visualization/logging:
+
+- Matplotlib.
+- Seaborn.
+- Python logging.
+
+Hạ tầng dữ liệu:
+
+- `tf.data.Dataset`.
+- Batch, shuffle, prefetch.
+- Deterministic seed để dễ tái lập.
+
+Môi trường:
+
+- macOS.
+- Python virtual environment `.venv`.
+- TensorFlow macOS/Metal tùy setup máy.
+
+## 19. Những Nguyên Tắc Quan Trọng Khi Dev Tiếp
+
+1. Không commit dataset/model/log nặng vào git.
+2. Không sửa trực tiếp `dataset/raw` nếu không có lý do rõ ràng.
+3. Khi đổi taxonomy, phải rebuild dataset và train lại.
+4. Khi train Stage B, đảm bảo `dataset_fruit_only` không có `other`.
+5. Khi inference, dùng đúng `labels.json` hoặc label manifest của model đã train.
+6. Không thay đổi preprocessing giữa train và inference.
+7. Không dùng accuracy một mình để kết luận model tốt.
+8. Luôn xem confusion matrix và weak classes.
+9. Nếu class folder train/val/test không khớp, phải split lại.
+10. Nếu model chạy backend, dùng `router_manifest.json` làm nguồn cấu hình duy nhất.
+
+## 20. Checklist Trước Khi Train Lại
+
+Trước preprocess:
+
+- `dataset/raw` tồn tại.
+- Mỗi class có ảnh hợp lệ.
+- Không có folder class bị đặt tên nhầm ngoài taxonomy.
+
+Trước split:
+
+- `dataset/processed_clean` hoặc `dataset/processed_crop` đã tạo xong.
+- Log preprocess không có lỗi bất thường.
+- Class count đúng với kỳ vọng.
+
+Trước Stage A:
+
+- `dataset/train`, `dataset/val`, `dataset/test` tồn tại.
+- Có class `other`.
+- Train/val/test có cùng class folder.
+- Không có split rỗng.
+
+Trước Stage B:
+
+- `dataset_fruit_only/train`, `dataset_fruit_only/val`, `dataset_fruit_only/test` tồn tại.
+- Không có class `other`.
+- Class count đúng với taxonomy hiện tại.
+- Class order nhất quán.
+
+Trước deploy/inference:
+
+- Có model Stage A.
+- Có label manifest Stage A.
+- Có model Stage B.
+- Có label manifest Stage B.
+- Có `router_manifest.json`.
+- Test thử `src/two_stage_inference.py` với ảnh fruit và ảnh non-fruit.
+
+## 21. Tóm Tắt Ngắn Gọn Cho Người Mới
+
+Project này train hệ thống nhận diện ảnh nông sản bằng ResNet50. Hệ thống không dùng một model duy nhất mà dùng hai tầng:
+
+- Stage A: ảnh có phải nông sản không?
+- Stage B: nếu là nông sản thì là loại nào?
+
+Dữ liệu đi từ raw -> clean -> crop -> split -> fruit-only. Train tạo ra model và manifest trong `experiments/`. Backend hoặc CLI inference dùng `router_manifest.json` để đảm bảo model, label order, image size và preprocessing khớp với lúc train.
+
+Điểm quan trọng nhất khi làm tiếp project là giữ đúng contract giữa dữ liệu, model và inference. Nếu đổi class, đổi preprocessing, đổi image size hoặc đổi label order mà không cập nhật manifest/train lại, kết quả inference sẽ sai hoặc rất khó debug.
