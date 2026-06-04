@@ -1,0 +1,11 @@
+# Khuyen nghi dung Python 3.11 hoac 3.12 tren macOS de tuong thich TensorFlow tot hon.
+tensorflow-macos
+tensorflow-metal
+numpy
+scikit-learn
+Pillow
+opencv-python
+ImageHash
+tqdm
+matplotlib
+seaborn

@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment
+.env
+.env.*
+
+# Training data and generated artifacts
+dataset/
+dataset_fruit_only/
+dataset_fruit_only_clean/
+dataset_fruit_only_crop/
+dataset_fruit_supported_v1/
+test_uploads_labeled/
+models/
+experiments/
+logs/
+archive_unused/
+
+# Model/checkpoint binaries
+*.keras
+*.h5
+*.hdf5
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.npy
+*.npz
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
