@@ -1,0 +1,3 @@
+model,model_type,run_dir,test_accuracy,macro_precision,macro_recall,macro_f1,weighted_f1,best_val_accuracy,min_val_loss,total_epochs,notes
+ResNet50 supported v1,resnet50,experiments/stage_b_supported_v1_resnet50_20260602_223530,0.808891,0.869927,0.793904,0.802252,0.814055,0.7987220287322998,0.7816721796989441,21,"Model hien tai dang dung cho Stage B production v1, 32 supported classes, khong co class other."
+MobileNetV2 best old run,mobilenetv2,archive_unused/resnet50_pipeline_cleanup_20260602_0100/logs/log_l1,0.750307,0.7818,0.7234,0.7113,0.7417,0.7606667876243591,0.8446701765060425,35,"Run MobileNetV2 cu tot nhat tim thay trong archive, dataset/class taxonomy khac pipeline supported v1 hien tai."

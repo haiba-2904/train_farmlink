@@ -122,32 +122,86 @@ class StageBSupportedV1Config:
     Production v1 chỉ train các class đã được chọn là đủ tin cậy trong
     `dataset_fruit_supported_v1`. Script không train Stage A, không sửa dataset
     gốc và không tự thêm lại class unsupported.
+
+    Stage B được huấn luyện theo 2 giai đoạn:
+    - Giai đoạn 1: đóng băng toàn bộ ResNet50 backbone, chỉ train classifier
+      head mới thêm phía sau. Mục tiêu là để phần head học cách ánh xạ đặc
+      trưng ImageNet sang 32 class nông sản mà không làm thay đổi backbone.
+    - Giai đoạn 2: mở fine-tune một phần các layer cuối của ResNet50 với
+      learning rate rất thấp. Mục tiêu là tinh chỉnh feature extractor cho
+      domain ảnh nông sản, nhưng vẫn hạn chế overfit và tránh phá pretrained
+      weights đã học từ ImageNet.
     """
 
+    # Root dataset chính thức của Stage B production v1. Dataset này đã loại
+    # class `other` và các class unsupported, nên model chỉ học 32 class được hỗ trợ.
     dataset_root: Path = Path("dataset_fruit_supported_v1")
+
+    # Tất cả artifact của một lần train được lưu vào:
+    # experiments/stage_b_supported_v1_resnet50_<timestamp>/
     experiment_root: Path = Path("experiments")
+
+    # Stage B production v1 chỉ dùng ResNet50, không dùng MobileNetV2 trong flow chính.
     model_type: str = "resnet50"
+
+    # ResNet50 trong project nhận ảnh 320x320x3. Ảnh được resize/pad giữ tỉ lệ
+    # trước khi đưa vào model để tránh làm méo hình dạng quả/nông sản.
     image_size: tuple[int, int] = (320, 320)
     input_shape: tuple[int, int, int] = (320, 320, 3)
+
+    # Batch size 16 được chọn để ổn định hơn trên Mac/Metal GPU và giảm rủi ro
+    # thiếu bộ nhớ khi fine-tune ResNet50.
     batch_size: int = 16
+
+    # Seed cố định giúp split/shuffle/augmentation có tính lặp lại khi cần so sánh thí nghiệm.
     seed: int = 42
+
+    # Số epoch tối đa cho từng giai đoạn. Thực tế có thể dừng sớm hơn vì
+    # EarlyStopping nếu validation loss không còn cải thiện.
     stage1_epochs: int = 12
     stage2_epochs: int = 20
+
+    # Stage 1 dùng learning rate cao hơn vì chỉ train classifier head.
+    # Stage 2 dùng learning rate thấp hơn nhiều vì lúc này đã fine-tune backbone.
     stage1_learning_rate: float = 3e-4
     stage2_learning_rate: float = 1e-5
+
+    # Chỉ mở 50 layer cuối của ResNet50 ở Stage 2. Các layer đầu thường học
+    # đặc trưng rất tổng quát như edge/texture nên giữ nguyên từ ImageNet.
     fine_tune_last_layers: int = 50
+
+    # Classifier head: Dense(512) + Dropout(0.5). Dropout giúp giảm overfit.
     dropout_rate: float = 0.5
     head_units: int = 512
+
+    # Early stopping theo dõi validation loss, giúp chọn checkpoint tốt nhất
+    # thay vì ép model train đủ toàn bộ epoch cấu hình.
     early_stopping_patience: int = 5
     shuffle_buffer_size: int = 1000
+
+    # Augmentation nhẹ cho fine-grained classification. Không dùng biến đổi màu
+    # mạnh trong baseline production v1 để tránh làm lệch đặc trưng màu của nông sản.
     resnet50_rotation_factor: float = 0.05
     resnet50_zoom_factor: float = 0.08
+
+    # Sanity loss dùng để bắt lỗi label/loss/output trước khi train thật.
+    # Nếu loss thử quá cao bất thường, có thể label index hoặc output shape đang sai.
     sanity_loss_ceiling: float = 10.0
+
+    # Class nào có recall thấp hơn ngưỡng này sẽ được ghi vào weak_classes.json.
     weak_recall_threshold: float = 0.60
+
+    # Production v1 mặc định không dùng class_weight để tránh over-predict một
+    # vài class ít mẫu. Nếu bật CLI --use-class-weight, weight vẫn bị clip nhẹ.
     use_class_weight: bool = False
     class_weight_clip_min: float = 0.8
     class_weight_clip_max: float = 1.2
+
+    # Các class này không train trong Stage B production v1; nếu gặp ở flow thật
+    # thì nên route sang manual_review hoặc xử lý bằng policy ngoài model.
     unsupported_classes: tuple[str, ...] = UNSUPPORTED_CLASSES_V1
+
+    # Extension ảnh hợp lệ khi đọc dataset.
     valid_extensions: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")
 
 
@@ -562,9 +616,28 @@ def run_training(config: StageBSupportedV1Config) -> Path:
     stage1_checkpoint = experiment_dir / "checkpoints" / "stage1_best.keras"
     stage2_checkpoint = experiment_dir / "checkpoints" / "stage2_best.keras"
 
-    # Stage 1: freeze ResNet50 backbone, chỉ train classifier head.
+    # ---------------------------------------------------------------------
+    # STAGE 1 - TRAIN CLASSIFIER HEAD
+    # ---------------------------------------------------------------------
+    # Ở giai đoạn này, toàn bộ ResNet50 backbone bị đóng băng
+    # (`base_model.trainable = False`). Nghĩa là các weight pretrained ImageNet
+    # không thay đổi. Model chỉ học các layer mới thêm phía sau:
+    # GlobalAveragePooling -> BatchNorm -> Dense(512) -> Dropout -> Softmax(32).
+    #
+    # Lý do cần Stage 1:
+    # - classifier head ban đầu là ngẫu nhiên, cần học trước cách phân biệt
+    #   32 class nông sản dựa trên feature có sẵn từ ResNet50;
+    # - nếu fine-tune backbone ngay từ đầu, gradient từ head còn chưa ổn định
+    #   có thể làm phá pretrained weights;
+    # - learning rate có thể cao hơn Stage 2 vì chỉ train số tham số nhỏ ở head.
     base_model.trainable = False
     compile_stage_b_model(model, learning_rate=config.stage1_learning_rate)
+
+    # Sanity check trước khi train để bắt lỗi sớm:
+    # - label phải là integer, không phải one-hot;
+    # - label phải nằm trong [0, num_classes - 1];
+    # - output của model phải có shape (batch_size, 32);
+    # - loss thử không được quá cao bất thường.
     run_pretrain_sanity_check(
         model=model,
         train_ds=train_ds,
@@ -589,9 +662,26 @@ def run_training(config: StageBSupportedV1Config) -> Path:
     stage1_best_val_loss = get_best_val_loss(history_stage1)
     logger.info("Stage 1 hoan tat | best_val_loss=%.6f", stage1_best_val_loss)
 
-    # Stage 2: fine-tune các layer cuối của ResNet50.
-    # Helper `set_fine_tuning_resnet` luôn freeze BatchNorm để tránh batch nhỏ
-    # làm lệch moving mean/variance pretrained.
+    # ---------------------------------------------------------------------
+    # STAGE 2 - FINE-TUNE TOP LAYERS OF RESNET50
+    # ---------------------------------------------------------------------
+    # Sau khi classifier head đã học tương đối ổn ở Stage 1, Stage 2 bắt đầu
+    # mở một phần backbone để model thích nghi tốt hơn với ảnh nông sản.
+    #
+    # Cụ thể:
+    # - chỉ mở `fine_tune_last_layers` layer cuối của ResNet50;
+    # - các layer đầu vẫn giữ nguyên vì chúng học feature tổng quát như cạnh,
+    #   màu, texture;
+    # - learning rate giảm xuống 1e-5 để cập nhật weight rất nhẹ;
+    # - BatchNormalization luôn frozen để tránh batch nhỏ làm lệch moving
+    #   mean/variance đã học từ ImageNet.
+    #
+    # Lý do cần Stage 2:
+    # - feature ImageNet là tổng quát, nhưng ảnh nông sản có domain riêng;
+    # - fine-tune giúp model học tốt hơn các chi tiết như vỏ, cuống, màu sắc,
+    #   hình dạng đặc trưng của từng loại nông sản;
+    # - validation loss của Stage 2 sẽ được so với Stage 1 để chọn checkpoint
+    #   cuối cùng.
     set_fine_tuning_resnet(
         base_model=base_model,
         fine_tune_last_layers=config.fine_tune_last_layers,
@@ -628,6 +718,11 @@ def run_training(config: StageBSupportedV1Config) -> Path:
         stage2_val_loss=stage2_best_val_loss,
         logger=logger,
     )
+
+    # Checkpoint cuối cùng không mặc định lấy Stage 2 một cách mù quáng.
+    # Hàm `load_best_checkpoint` so sánh best validation loss của Stage 1 và
+    # Stage 2. Stage nào tốt hơn trên validation set thì model của stage đó
+    # được dùng để evaluate test set và lưu thành `model.keras`.
     compile_stage_b_model(best_model, learning_rate=config.stage2_learning_rate)
 
     test_loss, test_accuracy = best_model.evaluate(test_ds, verbose=0)
